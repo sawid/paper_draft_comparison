@@ -4,13 +4,16 @@
 # out in red (latexdiff UNDERLINE style).
 #
 # Usage:
-#   compare_draft.sh <file.tex> [base-ref] [output.pdf]
+#   compare_draft.sh <file.tex> [base-ref] [--new <new-ref>] [output.pdf]
 #
-#   <file.tex>    current manuscript (must be inside a git repository)
-#   [base-ref]    git commit, tag or branch to compare against
-#                 (default: the first commit of the repository)
-#   [output.pdf]  where to write the result
-#                 (default: <name>_changes_since_<ref>.pdf next to the .tex)
+#   <file.tex>        manuscript (must be tracked in a git repository)
+#   [base-ref]        old side: git commit, tag or branch
+#                     (default: the first commit of the repository)
+#   [--new <new-ref>] new side: git commit, tag or branch
+#                     (default: the current file on disk, uncommitted edits included)
+#   [output.pdf]      where to write the result (default, next to the .tex:
+#                     <name>_changes_since_<base>.pdf, or
+#                     <name>_changes_<base>_to_<new>.pdf with --new)
 #
 # Options (environment variables):
 #   KEEP_BUILD=1      keep the temporary build folder for debugging
@@ -23,9 +26,22 @@ set -euo pipefail
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
-[[ $# -ge 1 ]] || { sed -n '2,20p' "$0"; exit 1; }
+usage() { sed -n '2,23p' "$0"; exit 1; }
 
-TEX_IN=$1
+NEW_REF=""
+POS=()
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --new) [[ $# -ge 2 ]] || die "--new needs a git revision"; NEW_REF=$2; shift 2 ;;
+    --new=*) NEW_REF=${1#--new=}; shift ;;
+    -h|--help) usage ;;
+    *) POS+=("$1"); shift ;;
+  esac
+done
+[[ ${#POS[@]} -ge 1 && ${#POS[@]} -le 3 ]] || usage
+[[ -z $NEW_REF || ${ALSO_MAIN:-0} != 1 ]] || die "ALSO_MAIN=1 only works without --new"
+
+TEX_IN=${POS[0]}
 [[ -f $TEX_IN ]] || die "file not found: $TEX_IN"
 TEX_DIR=$(cd "$(dirname "$TEX_IN")" && pwd)
 TEX_NAME=$(basename "$TEX_IN")
@@ -39,11 +55,26 @@ REPO=$(git -C "$TEX_DIR" rev-parse --show-toplevel 2>/dev/null) \
 REL_PATH=$(cd "$TEX_DIR" && git ls-files --full-name "$TEX_NAME")
 [[ -n $REL_PATH ]] || die "$TEX_NAME is not tracked by git"
 
-BASE_REF=${2:-$(git -C "$REPO" rev-list --max-parents=0 HEAD | tail -1)}
-git -C "$REPO" rev-parse --verify --quiet "$BASE_REF^{commit}" >/dev/null \
-  || die "unknown git revision: $BASE_REF"
+check_ref() {
+  git -C "$REPO" rev-parse --verify --quiet "$1^{commit}" >/dev/null \
+    || die "unknown git revision: $1"
+  git -C "$REPO" cat-file -e "$1:$REL_PATH" 2>/dev/null \
+    || die "$REL_PATH does not exist in revision $1"
+}
+
+BASE_REF=${POS[1]:-$(git -C "$REPO" rev-list --max-parents=0 HEAD | tail -1)}
+check_ref "$BASE_REF"
 SHORT_REF=$(git -C "$REPO" rev-parse --short "$BASE_REF")
-OUT_PDF=${3:-$TEX_DIR/${STEM}_changes_since_${SHORT_REF}.pdf}
+if [[ -n $NEW_REF ]]; then
+  check_ref "$NEW_REF"
+  SHORT_NEW=$(git -C "$REPO" rev-parse --short "$NEW_REF")
+  DEFAULT_OUT=$TEX_DIR/${STEM}_changes_${SHORT_REF}_to_${SHORT_NEW}.pdf
+  NEW_LABEL=$SHORT_NEW
+else
+  DEFAULT_OUT=$TEX_DIR/${STEM}_changes_since_${SHORT_REF}.pdf
+  NEW_LABEL="working copy"
+fi
+OUT_PDF=${POS[2]:-$DEFAULT_OUT}
 
 compile() {  # compile <dir> <stem>
   local dir=$1 stem=$2
@@ -82,8 +113,19 @@ rsync -a --exclude='*.aux' --exclude='*.log' --exclude='*.out' \
   --exclude="/${STEM}.pdf" --exclude="/${STEM}_changes*" --exclude='.git' \
   "$TEX_DIR/" "$BUILD/"
 
+# With --new, overlay the tracked files (figures, .bib, \input files ...) of
+# that revision, so the PDF matches it exactly. Untracked support files such
+# as a .cls still come from the working folder.
+REL_DIR=$(dirname "$REL_PATH")
+if [[ -n $NEW_REF ]]; then
+  STRIP=0; [[ $REL_DIR != . ]] && STRIP=$(awk -F/ '{print NF}' <<<"$REL_DIR")
+  git -C "$REPO" archive --format=tar "$NEW_REF" -- "$REL_DIR" \
+    | tar -x -C "$BUILD" --strip-components="$STRIP"
+  git -C "$REPO" show "$NEW_REF:$REL_PATH" > "$BUILD/__new.tex"
+else
+  cp "$TEX_DIR/$TEX_NAME" "$BUILD/__new.tex"
+fi
 git -C "$REPO" show "$BASE_REF:$REL_PATH" > "$BUILD/__old.tex"
-cp "$TEX_DIR/$TEX_NAME" "$BUILD/__new.tex"
 
 DIFF_STEM=${STEM}_diff
 # shellcheck disable=SC2086
@@ -97,7 +139,7 @@ compile "$BUILD" "$DIFF_STEM"
 report "DIFF" "$BUILD" "$DIFF_STEM"
 mkdir -p "$(dirname "$OUT_PDF")"
 cp "$BUILD/$DIFF_STEM.pdf" "$OUT_PDF"
-echo "Changes PDF ($SHORT_REF -> working copy): $OUT_PDF"
+echo "Changes PDF ($SHORT_REF -> $NEW_LABEL): $OUT_PDF"
 
 if [[ ${ALSO_MAIN:-0} == 1 ]]; then
   cp "$TEX_DIR/$TEX_NAME" "$BUILD/$STEM.tex"
